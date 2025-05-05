@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Info { id, details } => { commands::info::display_anime_info(id, *details, pool).await },
+        Commands::Update { full, verbose } => { commands::update::update_database(full, verbose, &config, &pool).await?; },
         _ => {}
     };
 
