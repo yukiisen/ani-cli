@@ -1,5 +1,6 @@
 #![allow(unused)]
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use indicatif::ProgressStyle;
@@ -51,6 +52,7 @@ pub async fn update_database (full: &bool, verbose: &bool, config: &Config, pool
         } else {
             name
         };
+
         target_animes.push(name);
     }
 
@@ -67,19 +69,37 @@ pub async fn update_database (full: &bool, verbose: &bool, config: &Config, pool
     // collect anime data.
     for (idx, anime_name) in target_animes.iter().enumerate() {
         spinner.set_message(format!("Fetching {anime_name}"));
-        
-        let first_result = search_anime(anime_name, Some(1), None).await?.data;
+
+        // Skip on error since i couldn't identify the weird error I'm getting.
+        let first_result =  match search_anime(anime_name, Some(1), None).await {
+            Ok(result) => result.data,
+            Err(error) => {
+                spinner.println(format!("Failed to fetch {anime_name}.."));
+                spinner.println(format!("{error}"));
+                continue;
+            }
+        };
+
         let Some(res) = first_result.first().cloned() else {
             spinner.println(format!("Failed to fetch {anime_name}."));
             continue;
         };
 
-        if res.title == *anime_name { 
+        if res.title.to_lowercase() == *anime_name.to_lowercase() { 
             if *verbose { spinner.println(format!("Found match for {anime_name}.")); };
-            results.push((anime_name, res));
+            results.push(({ if *full { &local_entries[idx] } else { anime_name } }, res));
+            add_or_update_anime(results.last().unwrap(), pool).await?;
+            if *verbose { spinner.println(format!("Saved {}.", results.last().unwrap().0)); };
         }
         else {
-            let more_results = search_anime(anime_name, Some(5), None).await?.data;
+			let more_results = match search_anime(anime_name, Some(5), None).await {
+			    Ok(result) => result.data,
+			    Err(error) => {
+			        spinner.println(format!("Failed to fetch {anime_name}.."));
+                    spinner.println(format!("{error}"));
+			        continue;
+			    }
+			};
 
             let found = spinner.suspend(|| {
                 println!("Could not match {anime_name}, please pick it manually:");
@@ -92,6 +112,10 @@ pub async fn update_database (full: &bool, verbose: &bool, config: &Config, pool
                     let mut buf = String::new();
                     std::io::stdout().flush().unwrap();
                     std::io::stdin().read_line(&mut buf).unwrap();
+
+                    if buf.trim().is_empty() {
+                        buf = "1".to_string();
+                    };
 
                     let Ok(index)= buf.trim().parse::<u8>() else {
                         continue;
@@ -113,8 +137,12 @@ pub async fn update_database (full: &bool, verbose: &bool, config: &Config, pool
                 if *full {
                     let local_name = &local_entries[idx];
                     results.push((local_name, anime));
+                    add_or_update_anime(results.last().unwrap(), pool).await?;
+                    if *verbose { spinner.println(format!("Saved {}.", local_name)); };
                 } else {
                     results.push((anime_name, anime));
+                    add_or_update_anime(results.last().unwrap(), pool).await?;
+                    if *verbose { spinner.println(format!("Saved {}.", anime_name)); };
                 }
 
             } else {
@@ -127,31 +155,54 @@ pub async fn update_database (full: &bool, verbose: &bool, config: &Config, pool
 
     spinner.finish_and_clear();
 
-    println!("Saving Data..");
-    for pair in &results {
-        add_or_update_anime(pair, pool).await?;
-        if *verbose { println!("Saved {}.", pair.0); };
-    }
-
     println!("All Data Has been saved.");
 
     println!("Downloading Images...");
     // download anime images
     for (name, anime) in &results {
         let url = &anime.images.webp.large_image_url;
-        let res = get(url).await?;
+        let image_path = PathBuf::from(&config.images).join(format!("{name}.webp"));
 
-        if res.status() == reqwest::StatusCode::OK {
-            let buf = res.bytes().await?;
-            let image_path = std::path::PathBuf::from(&config.images).join(format!("{name}.webp"));
-
-            fs::write(&image_path, buf).await?;
-
-            println!("Downloaded {}", &image_path.to_str().unwrap());
-        }
+        if let Err(error) = download_image(url, &image_path).await {
+            eprintln!("Hell man, {error}");
+        } else if *verbose {
+            println!("Downloaded {url}.");
+        };
     }
 
     Ok(())
+}
+
+const MAX_RETRY_COUNT: u8 = 5;
+const RETRY_DELAY: u64 = 500;
+
+async fn download_image (url: &str, out_path: &PathBuf) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        let res = get(url).await;
+
+        match res {
+            Ok(res) if res.status() == reqwest::StatusCode::OK => {
+                let buf = res.bytes().await?;
+                fs::write(out_path, buf).await?;
+                return Ok(());
+            },
+            Ok(res) => { eprintln!("Bad Response {}", res.status()) },
+            Err(error) => { eprintln!("Error {error}"); }
+        };
+
+        attempts += 1;
+
+        if attempts == MAX_RETRY_COUNT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "Max retries exceeded",
+            ).into());
+        };
+
+        let delay = Duration::from_millis(RETRY_DELAY * 2u64.pow(attempts as u32 - 1));
+        sleep(delay).await;
+    };
 }
 
 #[derive(Debug, FromRow)]
